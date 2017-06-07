@@ -1,10 +1,68 @@
 /*
  *  Calls.
  *
- *  Protected variants should avoid ever throwing an error.
+ *  Protected variants should avoid ever throwing an error.  Must be careful
+ *  to catch errors related to value stack manipulation  and property lookup,
+ *  not just the call itself.
  */
 
 #include "duk_internal.h"
+
+struct duk__pcall_prop_args {
+	duk_idx_t obj_idx;
+	duk_idx_t nargs;
+};
+typedef struct duk__pcall_prop_args duk__pcall_prop_args;
+
+struct duk__pcall_method_args {
+	duk_idx_t nargs;
+};
+typedef struct duk__pcall_method_args duk__pcall_method_args;
+
+struct duk__pcall_args {
+	duk_idx_t nargs;
+};
+typedef struct duk__pcall_args duk__pcall_args;
+
+DUK_LOCAL duk_idx_t duk__call_get_idx_func(duk_context *ctx, duk_idx_t nargs, duk_idx_t other) {
+	duk_idx_t idx_func;
+
+#if 0
+	duk_size_t off_stack_top;
+	duk_size_t off_stack_args;
+	duk_size_t off_stack_all;
+	duk_idx_t idx_func;         /* valstack index of 'func' and retval (relative to entry valstack_bottom) */
+
+	/* Argument validation and func/args offset. */
+	off_stack_top = (duk_size_t) ((duk_uint8_t *) thr->valstack_top - (duk_uint8_t *) thr->valstack_bottom);
+	off_stack_args = (duk_size_t) ((duk_size_t) num_stack_args * sizeof(duk_tval));
+	off_stack_all = off_stack_args + 2 * sizeof(duk_tval);
+	if (DUK_UNLIKELY(off_stack_all > off_stack_top)) {
+		/* Since stack indices are not reliable, we can't do anything useful
+		 * here.  Invoke the existing setjmp catcher, or if it doesn't exist,
+		 * call the fatal error handler.
+		 */
+		DUK_ERROR_TYPE_INVALID_ARGS(thr);
+		return 0;
+	}
+	idx_func = (duk_idx_t) ((off_stack_top - off_stack_all) / sizeof(duk_tval));
+	return idx_func;
+#endif
+
+	idx_func = duk_get_top(ctx) - nargs - other;
+	if (DUK_UNLIKELY(idx_func < 0 || nargs < 0)) {
+		/* We can't reliably pop anything here because the stack input
+		 * shape is incorrect.  So we throw an error; if the caller has
+		 * no catch point for this, a fatal error will occur.  For
+		 * protected calls an alternative would be to just return an
+		 * error code, but the stack would be in an unknown state which
+		 * might cause very hard to diagnose problems later on.
+		 */
+		DUK_ERROR_TYPE_INVALID_ARGS((duk_hthread *) ctx);
+		/* unreachable */
+	}
+	return idx_func;
+}
 
 /* Prepare value stack for a method call through an object property.
  * May currently throw an error e.g. when getting the property.
@@ -43,23 +101,13 @@ DUK_EXTERNAL void duk_call(duk_context *ctx, duk_idx_t nargs) {
 	DUK_ASSERT_CTX_VALID(ctx);
 	DUK_ASSERT(thr != NULL);
 
-	idx_func = duk_get_top(ctx) - nargs - 1;
-	if (DUK_UNLIKELY(idx_func < 0 || nargs < 0)) {
-		/* note that we can't reliably pop anything here */
-		DUK_ERROR_TYPE_INVALID_ARGS(thr);
-	}
+	idx_func = duk__call_get_idx_func(ctx, nargs, 1);
+	DUK_ASSERT(duk_is_valid_index(ctx, idx_func));
 
-	/* XXX: awkward; we assume there is space for this, overwrite
-	 * directly instead?
-	 */
-	duk_push_undefined(ctx);
-	duk_insert(ctx, idx_func + 1);
+	duk_insert_undefined(ctx, idx_func + 1);
 
 	call_flags = 0;  /* not protected, respect reclimit, not constructor */
-
-	duk_handle_call_unprotected(thr,           /* thread */
-	                            nargs,         /* num_stack_args */
-	                            call_flags);   /* call_flags */
+	duk_handle_call_unprotected(thr, idx_func, call_flags);
 }
 
 DUK_EXTERNAL void duk_call_method(duk_context *ctx, duk_idx_t nargs) {
@@ -70,20 +118,16 @@ DUK_EXTERNAL void duk_call_method(duk_context *ctx, duk_idx_t nargs) {
 	DUK_ASSERT_CTX_VALID(ctx);
 	DUK_ASSERT(thr != NULL);
 
-	idx_func = duk_get_top(ctx) - nargs - 2;  /* must work for nargs <= 0 */
-	if (DUK_UNLIKELY(idx_func < 0 || nargs < 0)) {
-		/* note that we can't reliably pop anything here */
-		DUK_ERROR_TYPE_INVALID_ARGS(thr);
-	}
+	idx_func = duk__call_get_idx_func(ctx, nargs, 2);
+	DUK_ASSERT(duk_is_valid_index(ctx, idx_func));
 
 	call_flags = 0;  /* not protected, respect reclimit, not constructor */
-
-	duk_handle_call_unprotected(thr,           /* thread */
-	                            nargs,         /* num_stack_args */
-	                            call_flags);   /* call_flags */
+	duk_handle_call_unprotected(thr, idx_func, call_flags);
 }
 
 DUK_EXTERNAL void duk_call_prop(duk_context *ctx, duk_idx_t obj_idx, duk_idx_t nargs) {
+	duk_hthread *thr = (duk_hthread *) ctx;
+
 	/*
 	 *  XXX: if duk_handle_call() took values through indices, this could be
 	 *  made much more sensible.  However, duk_handle_call() needs to fudge
@@ -94,85 +138,100 @@ DUK_EXTERNAL void duk_call_prop(duk_context *ctx, duk_idx_t obj_idx, duk_idx_t n
 	DUK_ASSERT_CTX_VALID(ctx);
 
 	obj_idx = duk_require_normalize_index(ctx, obj_idx);  /* make absolute */
+	if (DUK_UNLIKELY(nargs < 0)) {
+		DUK_ERROR_TYPE_INVALID_ARGS(thr);
+	}
 
 	duk__call_prop_prep_stack(ctx, obj_idx, nargs);
 
 	duk_call_method(ctx, nargs);
 }
 
-DUK_EXTERNAL duk_int_t duk_pcall(duk_context *ctx, duk_idx_t nargs) {
+DUK_LOCAL duk_ret_t duk__pcall_raw(duk_context *ctx, void *udata) {
 	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_small_uint_t call_flags;
+	duk__pcall_args *args;
 	duk_idx_t idx_func;
-	duk_int_t rc;
+	duk_idx_t nargs;
+	duk_int_t ret;
 
 	DUK_ASSERT_CTX_VALID(ctx);
-	DUK_ASSERT(thr != NULL);
+	DUK_ASSERT(udata != NULL);
 
-	idx_func = duk_get_top(ctx) - nargs - 1;  /* must work for nargs <= 0 */
-	if (DUK_UNLIKELY(idx_func < 0 || nargs < 0)) {
-		/* We can't reliably pop anything here because the stack input
-		 * shape is incorrect.  So we throw an error; if the caller has
-		 * no catch point for this, a fatal error will occur.  Another
-		 * alternative would be to just return an error.  But then the
-		 * stack would be in an unknown state which might cause some
-		 * very hard to diagnose problems later on.  Also note that even
-		 * if we did not throw an error here, the underlying call handler
-		 * might STILL throw an out-of-memory error or some other internal
-		 * fatal error.
-		 */
+	args = (duk__pcall_args *) udata;
+	nargs = args->nargs;
+
+	idx_func = duk__call_get_idx_func(ctx, nargs, 1);
+	DUK_ASSERT(duk_is_valid_index(ctx, idx_func));
+
+	duk_insert_undefined(ctx, idx_func + 1);
+
+	ret = duk_handle_call_unprotected(thr, idx_func, 0 /*call_flags*/);
+	DUK_ASSERT(ret == 0);
+	DUK_UNREF(ret);
+
+	return 1;
+}
+
+DUK_EXTERNAL duk_int_t duk_pcall(duk_context *ctx, duk_idx_t nargs) {
+	duk_hthread *thr = (duk_hthread *) ctx;
+	duk__pcall_args args;
+
+	DUK_ASSERT_CTX_VALID(ctx);
+
+	args.nargs = nargs;
+	if (DUK_UNLIKELY(nargs < 0)) {
 		DUK_ERROR_TYPE_INVALID_ARGS(thr);
 		return DUK_EXEC_ERROR;  /* unreachable */
 	}
 
-	/* Rely on the internal value stack reserve for these operations. */
-	duk_push_undefined(ctx);
-	duk_insert(ctx, idx_func + 1);
+	return duk_safe_call(ctx, duk__pcall_raw, (void *) &args /*udata*/, nargs + 1 /*nargs*/, 1 /*nrets*/);
+}
 
-	call_flags = 0;  /* respect reclimit, not constructor */
+DUK_LOCAL duk_ret_t duk__pcall_method_raw(duk_context *ctx, void *udata) {
+	duk_hthread *thr = (duk_hthread *) ctx;
+	duk__pcall_method_args *args;
+	duk_idx_t idx_func;
+	duk_idx_t nargs;
+	duk_int_t ret;
 
-	rc = duk_handle_call_protected(thr,           /* thread */
-	                               nargs,         /* num_stack_args */
-	                               call_flags);   /* call_flags */
+	DUK_ASSERT_CTX_VALID(ctx);
+	DUK_ASSERT(udata != NULL);
 
-	return rc;
+	args = (duk__pcall_method_args *) udata;
+	nargs = args->nargs;
+
+	/* XXX: full validation maybe unnecessary because duk_safe_call()
+	 * already checks (except for nargs < 0).
+	 */
+	idx_func = duk__call_get_idx_func(ctx, nargs, 2);
+	DUK_ASSERT(duk_is_valid_index(ctx, idx_func));
+
+	ret = duk_handle_call_unprotected(thr, idx_func, 0 /*call_flags*/);
+	DUK_ASSERT(ret == 0);
+	DUK_UNREF(ret);
+
+	return 1;
 }
 
 DUK_EXTERNAL duk_int_t duk_pcall_method(duk_context *ctx, duk_idx_t nargs) {
 	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_small_uint_t call_flags;
-	duk_idx_t idx_func;
-	duk_int_t rc;
+	duk__pcall_method_args args;
 
 	DUK_ASSERT_CTX_VALID(ctx);
-	DUK_ASSERT(thr != NULL);
 
-	idx_func = duk_get_top(ctx) - nargs - 2;  /* must work for nargs <= 0 */
-	if (DUK_UNLIKELY(idx_func < 0 || nargs < 0)) {
-		/* See comments in duk_pcall(). */
+	args.nargs = nargs;
+	if (DUK_UNLIKELY(nargs < 0)) {
 		DUK_ERROR_TYPE_INVALID_ARGS(thr);
 		return DUK_EXEC_ERROR;  /* unreachable */
 	}
 
-	call_flags = 0;  /* respect reclimit, not constructor */
-
-	rc = duk_handle_call_protected(thr,           /* thread */
-	                               nargs,         /* num_stack_args */
-	                               call_flags);   /* call_flags */
-
-	return rc;
+	return duk_safe_call(ctx, duk__pcall_method_raw, (void *) &args /*udata*/, nargs + 2 /*nargs*/, 1 /*nrets*/);
 }
 
-struct duk__pcall_prop_args {
-	duk_idx_t obj_idx;
-	duk_idx_t nargs;
-};
-typedef struct duk__pcall_prop_args duk__pcall_prop_args;
-
 DUK_LOCAL duk_ret_t duk__pcall_prop_raw(duk_context *ctx, void *udata) {
+	duk__pcall_prop_args *args;
 	duk_idx_t obj_idx;
 	duk_idx_t nargs;
-	duk__pcall_prop_args *args;
 
 	DUK_ASSERT_CTX_VALID(ctx);
 	DUK_ASSERT(udata != NULL);
@@ -183,6 +242,7 @@ DUK_LOCAL duk_ret_t duk__pcall_prop_raw(duk_context *ctx, void *udata) {
 
 	obj_idx = duk_require_normalize_index(ctx, obj_idx);  /* make absolute */
 	duk__call_prop_prep_stack(ctx, obj_idx, nargs);
+	/* FIXME: use internal call */
 	duk_call_method(ctx, nargs);
 	return 1;
 }
@@ -190,11 +250,6 @@ DUK_LOCAL duk_ret_t duk__pcall_prop_raw(duk_context *ctx, void *udata) {
 DUK_EXTERNAL duk_int_t duk_pcall_prop(duk_context *ctx, duk_idx_t obj_idx, duk_idx_t nargs) {
 	duk_hthread *thr = (duk_hthread *) ctx;
 	duk__pcall_prop_args args;
-
-	/*
-	 *  Must be careful to catch errors related to value stack manipulation
-	 *  and property lookup, not just the call itself.
-	 */
 
 	DUK_ASSERT_CTX_VALID(ctx);
 
@@ -205,10 +260,6 @@ DUK_EXTERNAL duk_int_t duk_pcall_prop(duk_context *ctx, duk_idx_t obj_idx, duk_i
 		return DUK_EXEC_ERROR;  /* unreachable */
 	}
 
-	/* Inputs: explicit arguments (nargs), +1 for key.  If the value stack
-	 * does not contain enough args, an error is thrown; this matches
-	 * behavior of the other protected call API functions.
-	 */
 	return duk_safe_call(ctx, duk__pcall_prop_raw, (void *) &args /*udata*/, nargs + 1 /*nargs*/, 1 /*nrets*/);
 }
 
@@ -219,8 +270,9 @@ DUK_EXTERNAL duk_int_t duk_safe_call(duk_context *ctx, duk_safe_call_function fu
 	DUK_ASSERT_CTX_VALID(ctx);
 	DUK_ASSERT(thr != NULL);
 
-	if (DUK_UNLIKELY(duk_get_top(ctx) < nargs || nargs < 0 || nrets < 0)) {
-		/* See comments in duk_pcall(). */
+	if (DUK_UNLIKELY(nargs < 0 || nrets < 0 ||
+	                (duk_idx_t) (thr->valstack_top - thr->valstack_bottom) < nargs ||  /* nargs too large compared to top? */
+	                (duk_idx_t) (thr->valstack_end - thr->valstack_top) < nrets)) {    /* nrets too large compared to reserve? */
 		DUK_ERROR_TYPE_INVALID_ARGS(thr);
 		return DUK_EXEC_ERROR;  /* unreachable */
 	}
@@ -240,16 +292,13 @@ DUK_EXTERNAL void duk_new(duk_context *ctx, duk_idx_t nargs) {
 
 	DUK_ASSERT_CTX_VALID(ctx);
 
-	idx_func = duk_get_top(ctx) - nargs - 1;
-	if (DUK_UNLIKELY(idx_func < 0 || nargs < 0)) {
-		/* note that we can't reliably pop anything here */
-		DUK_ERROR_TYPE_INVALID_ARGS(thr);
-	}
+	idx_func = duk__call_get_idx_func(ctx, nargs, 1);
+	DUK_ASSERT(duk_is_valid_index(ctx, idx_func));
 
 	duk_push_object(ctx);  /* default instance; internal proto updated by call handling */
 	duk_insert(ctx, idx_func + 1);
 
-	duk_handle_call_unprotected((duk_hthread *) ctx, nargs, DUK_CALL_FLAG_CONSTRUCTOR_CALL);
+	duk_handle_call_unprotected(thr, idx_func, DUK_CALL_FLAG_CONSTRUCTOR_CALL);
 }
 
 DUK_LOCAL duk_ret_t duk__pnew_helper(duk_context *ctx, void *udata) {
