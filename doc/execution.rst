@@ -28,15 +28,14 @@ There are three conceptual execution states for a Duktape heap:
 This conceptual model ignores details like heap initialization and
 transitions from one state to another by "call handling".
 
-Execution state is contained mostly in three stacks:
+Execution state is contained mostly in two stacks:
 
-* Call stack: used to track function calls
-
-* Catch stack: used to track try-catch-finally and other catchpoints specific
-  to the bytecode executor
+* Call stack: used to track function calls; call stack consists of
+  ``duk_activation`` entries, with each activation tracking its own
+  catchers (``duk_catcher``).
 
 * Value stack: contains the tagged values manipulated through the Duktape API
-  and in the bytecode executor
+  and in the bytecode executor.
 
 In addition to these there are execution control variables in ``duk_hthread``
 and ``duk_heap``.
@@ -56,12 +55,20 @@ Ecmascript function.  Such a call may be caused by an obvious API call like
 ``duk_get_prop()``, which may invoke a getter, or ``duk_to_string()`` which
 may invoke a ``toString()`` coercion method.
 
-The initial call into Duktape is usually handled using
-``duk_handle_call_(un)protected()`` which can handle a call from any state
-into any kind of target function.  Setting up a call involves a lot of state
-changes:
+The initial call into Duktape is ultimately handled either by
+``duk_handle_safe_call()``, which provides a setjmp/longjmp catchpoint,
+or ``duk_handle_call_unprotected()`` which handles an actual function call.
+Best practice is to use a protected call as the initial call into Duktape,
+but sometimes fatal errors caused by uncaught errors can be acceptable and
+an unprotected call may be done directly.
 
-* A setjmp catchpoint is needed for protected calls.
+Safe calls involve a setjmp catch point which is jumped to using ``longjmp()``
+if an error occurs inside the safe call.  The longjmp() will be caught by
+the current (innermost) setjmp catchpoint).  The catch point is responsible
+for unwinding call stack state so that when the safe call returns, the call
+stack and value stack are in their expected configuration.
+
+Setting up a call involves a lot of small state changes:
 
 * An activation record, ``duk_activation``, is allocated and set up for the
   new call.
@@ -77,14 +84,12 @@ changes:
 * Other small book-keeping (such as recursion depth tracking) is done.
 
 When a call returns, the state changes are reversed before returning to
-the caller.  If an error occurs during the call, a ``longjmp()`` will take
-place and will be caught by the current (innermost) setjmp catchpoint
-without tearing down the call state; the catchpoint will have to do that.
+the caller.
 
 If the target function is a Duktape/C function, the corresponding C function
 is looked up and called.  The C function now has access to a fresh value stack
 frame it can operate on using the Duktape API.  It can make further calls which
-get handled by ``duk_handle_call_(un)protected()``.
+get handled by ``duk_handle_call_unprotected()``.
 
 If the target function is an Ecmascript function, the value stack is resized
 for the function register count (nregs) established by the compiler during
@@ -95,14 +100,13 @@ proceeding to dispatch the next opcode.
 
 The bytecode executor has its own setjmp catchpoint.  If bytecode makes a
 call into a Duktape/C function it is handled normally using
-``duk_handle_call_(un)protected()``; such calls may happen also when the
+``duk_handle_call_unprotected()``; such calls may happen also when the
 bytecode executor uses the value stack API for various coercions etc.
 
-If bytecode makes a function call into an Ecmascript function it is handled
-specially by ``duk_handle_ecma_call_setup()``.  This call handler sets up a
-new activation similarly to ``duk_handle_call_(un)protected()``, but instead
-of doing a recursive call into the bytecode executor it returns to the bytecode
-executor which restarts execution and starts executing the call target without
+If bytecode makes a function call into an Ecmascript function it is flagged
+and handled specially by ``duk_handle_call_unprotected()``.  Instead of doing
+a recursive call into the bytecode executor it returns to the bytecode executor
+which restarts execution and starts executing the call target without
 increasing C stack depth.  The call handler also supports tail calls where an
 activation record is reused.
 
@@ -134,11 +138,10 @@ Basic functionality
 Setjmp catchpoint
 -----------------
 
-The ``duk_handle_call_protected()`` and ``duk_safe_call()`` catchpoints are only
-used to handle ordinary error throws which propagate out of the calling function.
-The bytecode executor setjmp catchpoint handles a wider variety of longjmp call
-types, and in many cases the longjmp may be handled without exiting the current
-function:
+The ``duk_safe_call()`` catchpoints are only used to handle ordinary error
+throws which propagate out of the calling function.  The bytecode executor
+setjmp catchpoint handles a wider variety of longjmp call types, and in many
+cases the longjmp may be handled without exiting the current function:
 
 * A slow break/continue uses a longjmp() so that if the break/continue crosses
   any finally clauses, they get executed as expected.  Similarly 'with' statement
@@ -155,8 +158,8 @@ function:
   call adjusts the states and uses this longjmp() type to restart execution
   in the target coroutine.
 
-* An ordinary throw is handled as in ``duk_handle_call_protected()`` with the
-  difference that there are both 'try' and 'finally' sites.
+* An ordinary throw is handled as in ``duk_safe_call()`` with the difference
+  that there are both 'try' and 'finally' sites.
 
 Returns, coroutine yields, and throws may propagate out of the initial bytecode
 executor entry and outwards to whatever code called into the executor.
@@ -204,11 +207,15 @@ Debugger support relies on:
 
 See ``debugger.rst`` for details.
 
-Call processing: duk_handle_call_(un)protected()
-================================================
+Call processing: duk_handle_call_unprotected()
+==============================================
 
 Call setup
 ----------
+
+FIXME: out of date in several details, update.
+
+FIXME: special calls like .apply()
 
 When handling a call, ``duk_handle_call_(un)protected()`` is given
 ``num_stack_args`` which indicates how many arguments have been pushed
@@ -286,10 +293,9 @@ ensured as follows:
 
 * The call stack does not grow by virtue of reusing the current activation.
 
-* The catch stack does not grow because the Ecmascript compiler never emits
-  a tailcall if there is a catch stack; tail calls are not possible if a
-  catch stack exists, because e.g. ``try`` and ``finally`` must be processable.
-  Hence, ``duk_handle_call_(un)protected()`` simply asserts for this condition.
+* The compiler never emits a tailcall if there are any catch stack entries
+  that might capture a ``return`` or an error throw.
+  ``duk_handle_call_unprotected()`` simply asserts for this condition.
 
 Call cleanup after a successful call
 ------------------------------------
@@ -316,6 +322,8 @@ To clean up after a call:
 
 Call cleanup after a failed call
 --------------------------------
+
+FIXME: out of date.
 
 When an error is thrown it is caught by the nearest ``setjmp`` catch point.
 If that catch point is in ``duk_handle_call_protected()`` the processing is
@@ -485,6 +493,8 @@ register overlap in such cases to improve performance.
 
 Growing and shrinking
 ---------------------
+
+FIXME: separate document.
 
 The value stack allocation size grows and shrinks as required by the active
 range, which changes e.g. during function calls.  Some hysteresis is applied
